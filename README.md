@@ -98,15 +98,57 @@ poetry run python -m funding_arb_bot.cli.main run --log-level INFO
 | Command | Description | Key Options |
 |---------|-------------|-------------|
 | `spot` | Continuously scan for opportunities (no trading) | `--min-edge-bps`, `--symbol`, `--verbose` |
+| `pnl` | Display PnL summary (realized, funding, fees, net) | None |
 | `funding-scan` | One-time funding rate snapshot | `--hl-symbol`, `--hours` |
-| `run` | Start live trading bot | `--log-level` |
+| `run` | **Start live trading bot** | `--log-level` |
+
+## Execution Flows
+
+### Entry Execution Flow
+
+```
+1. Check kill switch status
+2. Validate risk limits (total notional, per-symbol notional)
+3. Fetch prices from both exchanges
+4. Validate price spread is acceptable
+5. Convert USD notional → base quantities with lot size rounding
+6. Calculate aggressive limit prices with slippage buffer
+7. Place IOC limit orders simultaneously
+8. Check actual fills vs intended
+9. If imbalanced >2%, place makeup order on underfilled leg
+10. Record trades and fees in PnL tracker
+11. Persist position state to disk
+```
+
+### Exit Execution Flow
+
+```
+1. Fetch actual open positions from both exchanges
+2. Get current prices and calculate limit prices (2x slippage buffer)
+3. Try IOC limit orders first for slippage protection
+4. Fallback to market orders if price fetch fails
+5. Record exit trades in PnL tracker
+6. Calculate and log net PnL
+7. Persist cleared state to disk
+```
+
+### PnL Tracking
+
+The bot tracks:
+- **Realized PnL**: Profit/loss from closed positions
+- **Funding Earned**: All funding payments received (positive = earned, negative = paid)
+- **Fees Paid**: Trading fees on both exchanges
+- **Net PnL**: `Realized + Funding - Fees`
+
+View anytime: `poetry run python -m funding_arb_bot.cli.main pnl`
 
 ## Safety Notes
 
 - **Always test with small notional sizes first** (e.g., `EXECUTION__ORDER_NOTIONAL=50`)
 - Use `spot` command to validate opportunities before enabling live trading
-- Ensure adequate balances on both exchanges and monitor margin requirements
-- Execution is best-effort; failed hedges trigger cancellation attempts but manual supervision is recommended
+- Ensure adequate balances on both exchanges (minimum 2x your max notional per exchange)
 - Both exchanges charge funding every **8 hours** (00:00, 08:00, 16:00 UTC typically)
-- Monitor positions actively during first 24 hours of operation
+- Monitor `.positions.json` and logs actively during first 24 hours
+- If bot crashes, it will restore positions on restart from `.positions.json`
+- Kill switch will trip and halt bot if too many failures occur
 
