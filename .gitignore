@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*$py.class
+.Python
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Poetry
+poetry.lock
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Byte-compiled / optimized / DLL files
+*.so
+
+# Logs
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+*.iml
+
+# MacOS
+.DS_Store
