@@ -1,30 +1,17 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
-*.pyd
-*$py.class
-.Python
+# Dependencies
+node_modules/
 
-# Virtual environments
-.venv/
-venv/
-ENV/
-
-# Poetry
-poetry.lock
+# Build output
+dist/
 
 # Environment files
 .env
 .env.*
 !.env.example
 
-# Position state
+# Position state (runtime data)
 .positions.json
 .pnl_state.json
-
-# Byte-compiled / optimized / DLL files
-*.so
 
 # Logs
 logs/
@@ -35,5 +22,11 @@ logs/
 .idea/
 *.iml
 
+# Test coverage
+coverage/
+
 # MacOS
 .DS_Store
+
+# TypeScript cache
+*.tsbuildinfo

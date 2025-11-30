@@ -1,0 +1,41 @@
+{
+  "name": "funding-arb-bot",
+  "version": "1.0.0",
+  "description": "Funding rate arbitrage bot for Hyperliquid and Lighter",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "funding-arb": "./dist/cli/main.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsx watch src/cli/main.ts",
+    "start": "node dist/cli/main.js",
+    "spot": "tsx src/cli/main.ts spot",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist coverage",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "dependencies": {
+    "@nktkas/hyperliquid": "^0.27.1",
+    "lighter-ts-sdk": "^1.0.7",
+    "commander": "^13.0.0",
+    "chalk": "^5.4.1",
+    "dotenv": "^16.4.7",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "@vitest/coverage-v8": "^2.1.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.0"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "packageManager": "pnpm@9.12.3+sha512.cce0f9de9c5a7c95bef944169cc5dfe8741abfb145078c0d508b868056848a87c81e626246cb60967cbd7fd29a6c062ef73ff840d96b3c86c40ac92cf4a813ee"
+}
