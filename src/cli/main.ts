@@ -2,25 +2,38 @@
 /**
  * Funding Arbitrage Bot CLI
  *
- * Scans for funding rate arbitrage opportunities between Hyperliquid and Lighter
+ * Commands for scanning opportunities and running the trading bot.
  */
 
 import { Command } from "commander";
-import chalk from "chalk";
 import dotenv from "dotenv";
 import { HyperliquidClient } from "../exchanges/hyperliquid.js";
 import { LighterClient } from "../exchanges/lighter.js";
+import { fetchLighterFundingRates } from "../exchanges/lighter-api.js";
+import { DEFAULT_STRATEGY_CONFIG, type StrategyConfig } from "../strategy/types.js";
+import { PnLTracker } from "../infra/pnl-tracker.js";
+import { RateLimiter } from "../infra/rate-limiter.js";
+import { runBot, createBotContext, saveBotState, type BotCallbacks } from "../bot/runner.js";
+import {
+  log,
+  logInfo,
+  logSuccess,
+  logWarning,
+  logError,
+  logDim,
+  printOpportunityHeader,
+  printOpportunity,
+  printConfig,
+  printRiskLimits,
+  printPnlSummary,
+  printSymbolPnl,
+  printRecentTrades,
+  printRecentFundingPayments,
+  printStatus,
+  type Opportunity,
+} from "./display.js";
 
 dotenv.config();
-
-interface Opportunity {
-  symbol: string;
-  hlRate8hr: number;
-  lighterRate8hr: number;
-  edgeBps: number;
-  apy: number;
-  direction: string;
-}
 
 const program = new Command();
 
@@ -29,10 +42,13 @@ program
   .description("Funding rate arbitrage bot for Hyperliquid and Lighter")
   .version("1.0.0");
 
+// ============================================================================
+// SPOT Command - Read-only opportunity scanning
+// ============================================================================
 program
   .command("spot")
-  .description("Continuously spot funding arbitrage opportunities without trading")
-  .option("-e, --min-edge <bps>", "Minimum funding rate edge in basis points", "20")
+  .description("Scan for funding arbitrage opportunities (read-only)")
+  .option("-e, --min-edge <bps>", "Minimum edge in basis points", "20")
   .option("-s, --symbols <symbols...>", "Symbols to track (default: all common)")
   .option("-v, --verbose", "Show all compared symbols")
   .option("-i, --interval <seconds>", "Scan interval in seconds", "60")
@@ -44,46 +60,27 @@ program
     const interval = parseInt(options.interval) * 1000;
     const runOnce = options.once ?? false;
 
-    console.log(
-      chalk.cyan(`\n🔍 Scanning for funding arb opportunities (min edge: ${minEdgeBps} bps)...\n`)
-    );
-    console.log(
-      chalk.dim(
-        "Note: All rates normalized to 8hr for comparison (HL native=1hr, Lighter native=8hr)\n"
-      )
-    );
+    logInfo(`\n🔍 Scanning for funding arb opportunities (min edge: ${minEdgeBps} bps)...\n`);
+    logDim("Note: All rates normalized to 8hr for comparison (HL native=1hr, Lighter native=8hr)\n");
 
-    printHeader();
+    printOpportunityHeader();
 
     const hlClient = new HyperliquidClient({});
-    const lighterPrivateKey = process.env.LIGHTER_PRIVATE_KEY || process.env.API_PRIVATE_KEY;
-
-    // For spot-only mode, we don't need Lighter auth - just funding rates
-    // But we'll use direct API calls for funding rates
+    const rateLimiter = new RateLimiter(100, 50);
 
     try {
       while (true) {
-        const opportunities = await scanOpportunities(
-          hlClient,
-          symbols,
-          minEdgeBps,
-          verbose
-        );
+        await rateLimiter.throttle("scan");
+        const opportunities = await scanOpportunities(hlClient, symbols, minEdgeBps, verbose);
 
         if (opportunities.length > 0) {
           opportunities.sort((a, b) => Math.abs(b.edgeBps) - Math.abs(a.edgeBps));
           for (const opp of opportunities) {
             printOpportunity(opp);
           }
-          console.log(
-            chalk.green(
-              `\n✅ Found ${opportunities.length} opportunities at ${new Date().toLocaleTimeString()}\n`
-            )
-          );
+          logSuccess(`\n✅ Found ${opportunities.length} opportunities at ${new Date().toLocaleTimeString()}\n`);
         } else {
-          console.log(
-            chalk.yellow(`No opportunities found at ${new Date().toLocaleTimeString()}`)
-          );
+          logWarning(`No opportunities found at ${new Date().toLocaleTimeString()}`);
         }
 
         if (runOnce) break;
@@ -91,14 +88,17 @@ program
       }
     } catch (error) {
       if ((error as Error).message !== "SIGINT") {
-        console.error(chalk.red("\n❌ Error:"), error);
+        logError(`Error: ${error}`);
       }
     } finally {
       await hlClient.close();
-      console.log(chalk.dim("\nStopped scanning."));
+      logDim("\nStopped scanning.");
     }
   });
 
+// ============================================================================
+// RATES Command - Show current funding rates
+// ============================================================================
 program
   .command("rates")
   .description("Show current funding rates from both exchanges")
@@ -106,61 +106,229 @@ program
   .action(async (options) => {
     const symbols = options.symbols ?? [];
 
-    console.log(chalk.cyan("\n📊 Current Funding Rates\n"));
+    logInfo("\n📊 Current Funding Rates\n");
 
     const hlClient = new HyperliquidClient({});
 
     try {
-      // Fetch Hyperliquid rates
-      console.log(chalk.bold("Hyperliquid (1hr rates):"));
+      log("Hyperliquid (1hr rates):");
       const hlRates = await hlClient.getFundingRates(symbols);
       for (const rate of hlRates.slice(0, 20)) {
         const pct = (rate.rate * 100).toFixed(6);
-        const color = rate.rate > 0 ? chalk.green : rate.rate < 0 ? chalk.red : chalk.white;
-        console.log(`  ${rate.symbol.padEnd(10)} ${color(pct.padStart(12))}%`);
+        const prefix = rate.rate > 0 ? "+" : "";
+        log(`  ${rate.symbol.padEnd(10)} ${prefix}${pct.padStart(11)}%`);
       }
 
-      console.log(chalk.bold("\nLighter (8hr rates):"));
+      log("\nLighter (8hr rates):");
       const lighterRates = await fetchLighterFundingRates(symbols);
       for (const rate of lighterRates.slice(0, 20)) {
         const pct = (rate.rate * 100).toFixed(6);
-        const color = rate.rate > 0 ? chalk.green : rate.rate < 0 ? chalk.red : chalk.white;
-        console.log(`  ${rate.symbol.padEnd(10)} ${color(pct.padStart(12))}%`);
+        const prefix = rate.rate > 0 ? "+" : "";
+        log(`  ${rate.symbol.padEnd(10)} ${prefix}${pct.padStart(11)}%`);
       }
     } finally {
       await hlClient.close();
     }
   });
 
-// Helper to fetch Lighter funding rates directly (no auth needed)
-async function fetchLighterFundingRates(
-  symbols: string[]
-): Promise<Array<{ symbol: string; rate: number }>> {
-  const response = await fetch(
-    "https://mainnet.zklighter.elliot.ai/api/v1/funding-rates"
-  );
-  const data = (await response.json()) as {
-    funding_rates: Array<{
-      symbol: string;
-      rate: string;
-      exchange: string;
-    }>;
-  };
+// ============================================================================
+// RUN Command - Live trading bot
+// ============================================================================
+program
+  .command("run")
+  .description("Start the live trading bot")
+  // Strategy options
+  .option("-e, --min-edge <bps>", "Minimum edge to enter (bps)", "20")
+  .option("-x, --exit-edge <bps>", "Edge threshold to exit (bps)", "5")
+  .option("-n, --notional <usd>", "Order notional size in USD", "500")
+  .option("-m, --max-notional <usd>", "Max total notional", "10000")
+  .option("-s, --symbols <symbols...>", "Symbols to trade (ignored if --auto)")
+  .option("-a, --auto", "Auto-discover best opportunities (default)")
+  .option("--max-symbols <n>", "Max symbols to track in auto mode", "5")
+  .option("-i, --interval <seconds>", "Poll interval in seconds", "30")
+  .option("-v, --verbose", "Show detailed status on each poll")
+  .option("--dry-run", "Simulate trades without executing")
+  // Leverage options
+  .option("-l, --leverage <x>", "Target leverage (e.g., 2 = 2x)", String(DEFAULT_STRATEGY_CONFIG.leverage))
+  // Risk limit options
+  .option("--stop-loss <usd>", "Stop-loss per position in USD", String(DEFAULT_STRATEGY_CONFIG.stopLossUsd))
+  .option("--stop-loss-pct <pct>", "Stop-loss as % of notional (e.g., 0.2 = 20%)", String(DEFAULT_STRATEGY_CONFIG.stopLossPct))
+  .option("--take-profit <usd>", "Take-profit per position in USD", String(DEFAULT_STRATEGY_CONFIG.takeProfitUsd))
+  .option("--take-profit-pct <pct>", "Take-profit as % of notional", String(DEFAULT_STRATEGY_CONFIG.takeProfitPct))
+  .option("--max-hold <hours>", "Max hold time in hours (0 = disabled)", String(DEFAULT_STRATEGY_CONFIG.maxHoldTimeHours))
+  .option("--max-divergence <pct>", "Max price divergence between exchanges", String(DEFAULT_STRATEGY_CONFIG.maxPriceDivergencePct))
+  .option("--max-drawdown <usd>", "Max portfolio drawdown before kill switch", String(DEFAULT_STRATEGY_CONFIG.maxDrawdownUsd))
+  .option("--liq-buffer <pct>", "Buffer before liquidation to exit (e.g., 0.2 = 20%)", String(DEFAULT_STRATEGY_CONFIG.liquidationBufferPct))
+  .action(async (options) => {
+    const hlPrivateKey = process.env.HYPERLIQUID_PRIVATE_KEY as `0x${string}` | undefined;
+    const lighterPrivateKey = process.env.LIGHTER_PRIVATE_KEY;
+    const dryRun = options.dryRun ?? false;
 
-  const symbolSet = new Set(symbols);
-  const results: Array<{ symbol: string; rate: number }> = [];
+    if (!dryRun && (!hlPrivateKey || !lighterPrivateKey)) {
+      logError("\nMissing credentials. Set HYPERLIQUID_PRIVATE_KEY and LIGHTER_PRIVATE_KEY in .env\n");
+      process.exit(1);
+    }
 
-  for (const rate of data.funding_rates) {
-    if (rate.exchange !== "lighter") continue;
-    if (symbolSet.size > 0 && !symbolSet.has(rate.symbol)) continue;
-    results.push({
-      symbol: rate.symbol,
-      rate: parseFloat(rate.rate),
+    const autoDiscover = options.auto ?? !options.symbols;
+    const symbols = options.symbols ?? ["ETH", "BTC", "SOL"];
+
+    const strategyConfig: StrategyConfig = {
+      ...DEFAULT_STRATEGY_CONFIG,
+      minEdgeBps: parseFloat(options.minEdge),
+      exitEdgeBps: parseFloat(options.exitEdge),
+      orderNotionalUsd: parseFloat(options.notional),
+      maxTotalNotionalUsd: parseFloat(options.maxNotional),
+      symbols,
+      // Leverage
+      leverage: parseFloat(options.leverage),
+      // Risk limits
+      stopLossUsd: parseFloat(options.stopLoss),
+      stopLossPct: parseFloat(options.stopLossPct),
+      takeProfitUsd: parseFloat(options.takeProfit),
+      takeProfitPct: parseFloat(options.takeProfitPct),
+      maxHoldTimeHours: parseFloat(options.maxHold),
+      maxPriceDivergencePct: parseFloat(options.maxDivergence),
+      maxDrawdownUsd: parseFloat(options.maxDrawdown),
+      liquidationBufferPct: parseFloat(options.liqBuffer),
+    };
+
+    logInfo("\n🤖 Starting Funding Arbitrage Bot\n");
+    
+    printConfig({
+      minEdgeBps: strategyConfig.minEdgeBps,
+      exitEdgeBps: strategyConfig.exitEdgeBps,
+      orderNotionalUsd: strategyConfig.orderNotionalUsd,
+      maxTotalNotionalUsd: strategyConfig.maxTotalNotionalUsd,
+      symbols: autoDiscover ? `AUTO (max ${options.maxSymbols})` : symbols.join(", "),
+      pollIntervalMs: parseInt(options.interval) * 1000,
+      mode: dryRun ? "DRY RUN (no real trades)" : "LIVE TRADING",
+      leverage: strategyConfig.leverage,
     });
-  }
 
-  return results;
-}
+    printRiskLimits({
+      leverage: strategyConfig.leverage,
+      maintenanceMarginRate: strategyConfig.maintenanceMarginRate,
+      stopLossUsd: strategyConfig.stopLossUsd,
+      stopLossPct: strategyConfig.stopLossPct,
+      takeProfitUsd: strategyConfig.takeProfitUsd,
+      takeProfitPct: strategyConfig.takeProfitPct,
+      maxHoldTimeHours: strategyConfig.maxHoldTimeHours,
+      maxPriceDivergencePct: strategyConfig.maxPriceDivergencePct,
+      maxDrawdownUsd: strategyConfig.maxDrawdownUsd,
+      liquidationBufferPct: strategyConfig.liquidationBufferPct,
+    });
+    
+    log("");
+
+    if (!dryRun) {
+      logWarning("LIVE TRADING MODE - Real money at risk!\n");
+      await sleep(3000);
+    }
+
+    // Initialize clients
+    const hlClient = new HyperliquidClient({
+      privateKey: dryRun ? undefined : hlPrivateKey,
+    });
+
+    let lighterClient: LighterClient | null = null;
+    if (!dryRun && lighterPrivateKey) {
+      lighterClient = new LighterClient({
+        privateKey: lighterPrivateKey,
+        accountIndex: parseInt(process.env.LIGHTER_ACCOUNT_INDEX ?? "0"),
+        apiKeyIndex: parseInt(process.env.LIGHTER_API_KEY_INDEX ?? "0"),
+      });
+    }
+
+    // Create bot context
+    const ctx = createBotContext(
+      {
+        strategy: strategyConfig,
+        pollIntervalMs: parseInt(options.interval) * 1000,
+        dryRun,
+        verbose: options.verbose ?? false,
+        autoDiscover,
+        maxSymbols: parseInt(options.maxSymbols),
+      },
+      hlClient,
+      lighterClient
+    );
+
+    // Set up abort controller for graceful shutdown
+    const abortController = new AbortController();
+
+    const shutdown = async () => {
+      logDim("\n\nShutting down...");
+      abortController.abort();
+
+      saveBotState(ctx);
+      logSuccess("💾 State saved to disk");
+
+      const pnl = ctx.pnlTracker.getSummary();
+      printPnlSummary(pnl);
+
+      await hlClient.close();
+      if (lighterClient) await lighterClient.close();
+      process.exit(0);
+    };
+
+    process.on("SIGINT", shutdown);
+    process.on("SIGTERM", shutdown);
+
+    // Callbacks for bot events
+    const callbacks: BotCallbacks = {
+      onLog: (msg) => log(msg),
+      onWarn: (msg) => logWarning(msg),
+      onError: (msg) => logError(msg),
+      onStatusUpdate: (status) => {
+        if (status.positionCount > 0 || options.verbose) {
+          printStatus(status);
+        }
+      },
+    };
+
+    logDim("Starting main loop... (warming up funding history)\n");
+
+    await runBot(
+      {
+        strategy: strategyConfig,
+        pollIntervalMs: parseInt(options.interval) * 1000,
+        dryRun,
+        verbose: options.verbose ?? false,
+        autoDiscover,
+        maxSymbols: parseInt(options.maxSymbols),
+      },
+      ctx,
+      callbacks,
+      abortController.signal
+    );
+
+    await shutdown();
+  });
+
+// ============================================================================
+// PNL Command - Show PnL summary
+// ============================================================================
+program
+  .command("pnl")
+  .description("Show PnL summary")
+  .option("--by-symbol", "Show breakdown by symbol")
+  .action((options) => {
+    const pnlTracker = new PnLTracker();
+    const summary = pnlTracker.getSummary();
+
+    printPnlSummary(summary);
+
+    if (options.bySymbol) {
+      printSymbolPnl(pnlTracker.getPnlBySymbol());
+    }
+
+    printRecentTrades(pnlTracker.getRecentTrades(10));
+    printRecentFundingPayments(pnlTracker.getRecentFundingPayments(5));
+  });
+
+// ============================================================================
+// Helper Functions
+// ============================================================================
 
 async function scanOpportunities(
   hlClient: HyperliquidClient,
@@ -168,132 +336,69 @@ async function scanOpportunities(
   minEdgeBps: number,
   verbose: boolean
 ): Promise<Opportunity[]> {
-  // Fetch both rates in parallel
-  const [hlRates, lighterRatesRaw] = await Promise.all([
+  const [hlRates, lighterRates] = await Promise.all([
     hlClient.getFundingRates([]),
-    fetchLighterFundingRates([]),
+    fetchLighterFundingRates(),
   ]);
 
-  // Build rate maps
-  const hlRateMap = new Map<string, number>();
-  for (const rate of hlRates) {
-    hlRateMap.set(rate.symbol, rate.rate);
-  }
+  const hlRateMap = new Map(hlRates.map((r) => [r.symbol, r.rate]));
+  const lighterRateMap = new Map(lighterRates.map((r) => [r.symbol, r.rate]));
 
-  const lighterRateMap = new Map<string, number>();
-  for (const rate of lighterRatesRaw) {
-    lighterRateMap.set(rate.symbol, rate.rate);
-  }
-
-  // Find common symbols
   const symbolsToCheck =
     symbols.length > 0
       ? new Set(symbols)
       : new Set([...hlRateMap.keys()].filter((s) => lighterRateMap.has(s)));
 
   const opportunities: Opportunity[] = [];
-  const compared: Array<{
-    symbol: string;
-    hlRate8hr: number;
-    lighterRate8hr: number;
-    edgeBps: number;
-  }> = [];
+  const compared: Array<{ symbol: string; hlRate8hr: number; lighterRate8hr: number; edgeBps: number }> = [];
 
   for (const symbol of symbolsToCheck) {
     const hlRate1hr = hlRateMap.get(symbol);
     const lighterRate8hr = lighterRateMap.get(symbol);
 
     if (hlRate1hr === undefined || lighterRate8hr === undefined) continue;
-
-    // CRITICAL: Normalize both to 8hr rates
-    // Hyperliquid is 1hr, Lighter is 8hr
-    const hlRate8hr = hlRate1hr * 8;
-
-    // Skip if both are zero
     if (hlRate1hr === 0 && lighterRate8hr === 0) continue;
 
-    // Edge in basis points
+    const hlRate8hr = hlRate1hr * 8;
     const edgeBps = (hlRate8hr - lighterRate8hr) * 10000;
-    // APY: 3 funding payments per day (8hr), convert bps to %
     const apy = (Math.abs(edgeBps) * 3 * 365) / 100;
 
     compared.push({ symbol, hlRate8hr, lighterRate8hr, edgeBps });
 
     if (Math.abs(edgeBps) >= minEdgeBps) {
-      const direction =
-        edgeBps > 0
-          ? "Long Lighter / Short Hyperliquid"
-          : "Long Hyperliquid / Short Lighter";
-
       opportunities.push({
         symbol,
         hlRate8hr,
         lighterRate8hr,
         edgeBps,
         apy,
-        direction,
+        direction: edgeBps > 0 ? "Long Lighter / Short Hyperliquid" : "Long Hyperliquid / Short Lighter",
       });
     }
   }
 
   if (verbose && compared.length > 0) {
-    console.log(
-      chalk.dim(`\nCompared ${compared.length} symbols available on both exchanges`)
-    );
+    logDim(`\nCompared ${compared.length} symbols available on both exchanges`);
     compared.sort((a, b) => Math.abs(b.edgeBps) - Math.abs(a.edgeBps));
     for (const c of compared.slice(0, 10)) {
-      console.log(
-        chalk.dim(
-          `  ${c.symbol.padEnd(10)} HL:${(c.hlRate8hr * 100).toFixed(4).padStart(8)}% ` +
-            `Ltr:${(c.lighterRate8hr * 100).toFixed(4).padStart(8)}% Edge:${c.edgeBps.toFixed(2).padStart(7)}bps`
-        )
+      logDim(
+        `  ${c.symbol.padEnd(10)} HL:${(c.hlRate8hr * 100).toFixed(4).padStart(8)}% ` +
+          `Ltr:${(c.lighterRate8hr * 100).toFixed(4).padStart(8)}% Edge:${c.edgeBps.toFixed(2).padStart(7)}bps`
       );
     }
-    console.log();
+    log("");
   }
 
   return opportunities;
-}
-
-function printHeader(): void {
-  const header = [
-    chalk.bold("Symbol".padEnd(10)),
-    chalk.bold("HL 8hr %".padStart(12)),
-    chalk.bold("Ltr 8hr %".padStart(12)),
-    chalk.bold("Edge".padStart(10)),
-    chalk.bold("APY %".padStart(10)),
-    chalk.bold("Direction".padEnd(35)),
-  ].join(" ");
-
-  console.log(header);
-  console.log("=".repeat(100));
-}
-
-function printOpportunity(opp: Opportunity): void {
-  const edgeColor = opp.edgeBps > 0 ? chalk.green : chalk.red;
-  const apyColor = opp.apy > 100 ? chalk.yellow : chalk.white;
-
-  const row = [
-    opp.symbol.padEnd(10),
-    (opp.hlRate8hr * 100).toFixed(6).padStart(11),
-    (opp.lighterRate8hr * 100).toFixed(6).padStart(11),
-    edgeColor(opp.edgeBps.toFixed(2).padStart(9)),
-    apyColor(opp.apy.toFixed(1).padStart(9)),
-    opp.direction.padEnd(35),
-  ].join(" ");
-
-  console.log(row);
 }
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-// Handle graceful shutdown
 process.on("SIGINT", () => {
-  console.log(chalk.dim("\n\nReceived SIGINT, shutting down..."));
+  logDim("\n\nReceived SIGINT, shutting down...");
   process.exit(0);
 });
 
 program.parse();
-

@@ -32,8 +32,12 @@ export class HyperliquidClient implements ExchangeClient {
   private infoClient: hl.InfoClient;
   private exchangeClient?: hl.ExchangeClient;
   private symbolsCache?: Map<string, SymbolSpec>;
+  private assetIndexMap?: Map<string, number>;
+  private config: HyperliquidConfig;
+  private walletAddress?: string;
 
-  constructor(private config: HyperliquidConfig = {}) {
+  constructor(config: HyperliquidConfig = {}) {
+    this.config = config;
     this.transport = new hl.HttpTransport({
       isTestnet: config.isTestnet ?? false,
     });
@@ -47,6 +51,16 @@ export class HyperliquidClient implements ExchangeClient {
     }
   }
 
+  private async ensureWalletAddress(): Promise<string> {
+    if (this.walletAddress) return this.walletAddress;
+    if (!this.config.privateKey) throw new Error("Private key required");
+
+    const { privateKeyToAccount } = await import("viem/accounts");
+    const account = privateKeyToAccount(this.config.privateKey);
+    this.walletAddress = account.address;
+    return this.walletAddress;
+  }
+
   async getSymbols(): Promise<SymbolSpec[]> {
     if (this.symbolsCache) {
       return Array.from(this.symbolsCache.values());
@@ -54,8 +68,10 @@ export class HyperliquidClient implements ExchangeClient {
 
     const meta = await this.infoClient.meta();
     const mapping = new Map<string, SymbolSpec>();
+    const indexMap = new Map<string, number>();
 
-    for (const asset of meta.universe) {
+    for (let i = 0; i < meta.universe.length; i++) {
+      const asset = meta.universe[i];
       const symbol = asset.name;
       const pxDecimals = asset.szDecimals ?? 4;
       const szDecimals = asset.szDecimals ?? 3;
@@ -68,9 +84,12 @@ export class HyperliquidClient implements ExchangeClient {
         lotSize: Math.pow(10, -szDecimals),
         maxLeverage: asset.maxLeverage ?? 10,
       });
+
+      indexMap.set(symbol, i);
     }
 
     this.symbolsCache = mapping;
+    this.assetIndexMap = indexMap;
     return Array.from(mapping.values());
   }
 
@@ -119,16 +138,10 @@ export class HyperliquidClient implements ExchangeClient {
   }
 
   async getPositions(): Promise<Position[]> {
-    if (!this.exchangeClient) {
-      throw new Error("Private key required for positions");
-    }
-
-    // Need wallet address - extract from private key
-    const { privateKeyToAccount } = await import("viem/accounts");
-    const account = privateKeyToAccount(this.config.privateKey!);
+    const address = await this.ensureWalletAddress();
 
     const state = await this.infoClient.clearinghouseState({
-      user: account.address,
+      user: address,
     });
 
     return state.assetPositions.map((ap) => {
@@ -144,6 +157,106 @@ export class HyperliquidClient implements ExchangeClient {
     });
   }
 
+  /**
+   * Get account balance and margin info
+   */
+  async getAccountInfo(): Promise<{
+    balance: number;
+    marginUsed: number;
+    freeMargin: number;
+    withdrawable: number;
+  }> {
+    const address = await this.ensureWalletAddress();
+
+    const state = await this.infoClient.clearinghouseState({
+      user: address,
+    });
+
+    const marginSummary = state.marginSummary;
+    const accountValue = parseFloat(marginSummary.accountValue);
+    const totalMarginUsed = parseFloat(marginSummary.totalMarginUsed);
+
+    return {
+      balance: accountValue,
+      marginUsed: totalMarginUsed,
+      freeMargin: accountValue - totalMarginUsed,
+      withdrawable: parseFloat(state.withdrawable),
+    };
+  }
+
+  /**
+   * Get funding payment history
+   */
+  async getFundingPayments(since?: number): Promise<Array<{
+    symbol: string;
+    amount: number;
+    timestamp: number;
+    rate: number;
+    positionSize: number;
+  }>> {
+    const address = await this.ensureWalletAddress();
+
+    const response = await this.infoClient.userFunding({
+      user: address,
+      startTime: since ?? Date.now() - 7 * 24 * 60 * 60 * 1000, // Last 7 days default
+    });
+
+    return response.map((f) => ({
+      symbol: f.delta.coin,
+      amount: parseFloat(f.delta.usdc),
+      timestamp: f.time,
+      rate: parseFloat(f.delta.fundingRate),
+      positionSize: parseFloat(f.delta.szi),
+    }));
+  }
+
+  /**
+   * Get user's recent fills/trades
+   */
+  async getRecentFills(symbol?: string, limit: number = 50): Promise<Array<{
+    symbol: string;
+    side: Side;
+    size: number;
+    price: number;
+    fee: number;
+    timestamp: number;
+    orderId: string;
+  }>> {
+    const address = await this.ensureWalletAddress();
+
+    const fills = await this.infoClient.userFills({
+      user: address,
+    });
+
+    let filtered = fills;
+    if (symbol) {
+      filtered = fills.filter((f) => f.coin === symbol);
+    }
+
+    return filtered.slice(0, limit).map((f) => ({
+      symbol: f.coin,
+      side: f.side === "B" ? Side.BUY : Side.SELL,
+      size: parseFloat(f.sz),
+      price: parseFloat(f.px),
+      fee: parseFloat(f.fee),
+      timestamp: f.time,
+      orderId: String(f.oid),
+    }));
+  }
+
+  /**
+   * Get fee rate for the account
+   */
+  async getFeeRate(): Promise<{ maker: number; taker: number }> {
+    // HL fee structure - could be fetched from API but using defaults
+    // Standard taker: 0.035%, maker: 0.01%
+    // These can vary based on volume tier
+    return {
+      maker: 0.0001, // 0.01%
+      taker: 0.00035, // 0.035%
+    };
+  }
+
   async placeOrder(order: OrderRequest): Promise<OrderResult> {
     if (!this.exchangeClient) {
       throw new Error("Private key required for trading");
@@ -151,9 +264,8 @@ export class HyperliquidClient implements ExchangeClient {
 
     // Get asset index
     await this.getSymbols();
-    const symbols = Array.from(this.symbolsCache!.keys());
-    const assetIndex = symbols.indexOf(order.symbol);
-    if (assetIndex === -1) {
+    const assetIndex = this.assetIndexMap!.get(order.symbol);
+    if (assetIndex === undefined) {
       throw new Error(`Unknown symbol: ${order.symbol}`);
     }
 
@@ -185,7 +297,7 @@ export class HyperliquidClient implements ExchangeClient {
       return {
         clientId: order.clientId,
         exchangeOrderId: "resting" in status ? String(status.resting.oid) : "0",
-        status: "resting" in status ? "open" : "filled",
+        status: filled ? "filled" : "resting" in status ? "open" : "failed",
         filledSize: filled?.totalSz ? parseFloat(filled.totalSz) : 0,
         averageFillPrice: filled?.avgPx ? parseFloat(filled.avgPx) : undefined,
       };
@@ -221,17 +333,32 @@ export class HyperliquidClient implements ExchangeClient {
     }
   }
 
-  async cancelOrder(exchangeOrderId: string): Promise<void> {
+  async cancelOrder(exchangeOrderId: string, symbol?: string): Promise<void> {
     if (!this.exchangeClient) {
       throw new Error("Private key required for cancellation");
     }
 
-    // HL cancel requires asset index - need to track this in real implementation
-    throw new Error("Cancel requires asset context - not implemented yet");
+    if (!symbol) {
+      throw new Error("Symbol required for cancellation on Hyperliquid");
+    }
+
+    await this.getSymbols();
+    const assetIndex = this.assetIndexMap!.get(symbol);
+    if (assetIndex === undefined) {
+      throw new Error(`Unknown symbol: ${symbol}`);
+    }
+
+    await this.exchangeClient.cancel({
+      cancels: [
+        {
+          a: assetIndex,
+          o: parseInt(exchangeOrderId),
+        },
+      ],
+    });
   }
 
   async close(): Promise<void> {
     // HTTP transport doesn't need explicit cleanup
   }
 }
-
